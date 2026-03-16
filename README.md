@@ -57,13 +57,17 @@ Makefile           — Build configuration
 
 ## Input Format
 
-Accepts tab-delimited text files exported from Biacore instruments. The parser handles:
+Currently accepts tab-delimited text files exported from **Biacore Evaluation Software**. The parser handles:
 
 - Standard MCK format with `_X` / `_Y` column pairs per cycle
 - Instrument-fitted overlay columns (`; Fitted_X` / `; Fitted_Y`)
 - Excluded cycles (marked in headers)
 - Duplicate/triplicate replicates at the same concentration
 - SCK staircase injection traces
+
+## Example Data
+
+The `example_data/` directory contains sample MCK datasets (FUR-CA2 series) that can be used for testing. These include files with and without instrument-fitted overlays, as well as files with duplicate replicates.
 
 ## License
 
