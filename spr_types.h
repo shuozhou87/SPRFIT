@@ -9,9 +9,9 @@
 
 #define MAX_CYCLES      30
 #define MAX_POINTS      2500
-#define MAX_PARAMS      8
+#define MAX_PARAMS      128     /* Enough for global + local (RI, drift per cycle) */
 #define MAX_INJECTIONS  10
-#define DISPLAY_SKIP    5      /* Output every Nth point for display */
+#define DISPLAY_SKIP    5       /* Output every Nth point for display */
 
 /* ── Data Mode ─────────────────────────────────────────────────── */
 
@@ -65,6 +65,36 @@ typedef struct {
     int      excluded[MAX_CYCLES];          /* 1 = excluded from fitting */
 } SPRData;
 
+/* ── Advanced Fitting Options ─────────────────────────────────── */
+
+typedef struct {
+    int enable_ri;          /* 1 = fit bulk RI (refractive index) per cycle */
+    int enable_drift;       /* 1 = fit linear drift per cycle */
+    int enable_tc;          /* 1 = fit mass transport coefficient (two-compartment model) */
+} AdvancedConfig;
+
+static inline AdvancedConfig advanced_config_default(void) {
+    AdvancedConfig adv;
+    adv.enable_ri = 0;
+    adv.enable_drift = 0;
+    adv.enable_tc = 0;
+    return adv;
+}
+
+/* ── Parameter Layout ─────────────────────────────────────────── */
+/* Maps parameter vector indices to global and per-cycle local params */
+
+typedef struct {
+    int n_global;           /* Number of global (model) params */
+    int n_active;           /* Number of non-excluded cycles */
+    int active_map[MAX_CYCLES];       /* active_map[active_idx] = cycle_idx */
+    int cycle_to_active[MAX_CYCLES];  /* cycle_to_active[cycle_idx] = active_idx (-1 if excluded) */
+    int off_ri;             /* -1 if disabled, else start index of RI params (per cycle) */
+    int off_drift;          /* -1 if disabled, else index of single global drift param */
+    int off_tc;             /* -1 if disabled, else index of global mass transport param (log10) */
+    int total;              /* Total number of params */
+} ParamLayout;
+
 /* ── Fit Configuration ─────────────────────────────────────────── */
 
 typedef struct {
@@ -77,6 +107,7 @@ typedef struct {
     double    t_assoc_end;      /* End of association phase (default 60s) */
     int       t_assoc_end_set;  /* 1 = user explicitly set, 0 = auto-detect */
     double    dt;               /* Max RK4 step size */
+    AdvancedConfig advanced;    /* Advanced fitting options */
 } FitConfig;
 
 /* Default configuration */
@@ -91,6 +122,7 @@ static inline FitConfig fit_config_default(void) {
     cfg.t_assoc_end = 60.0;
     cfg.t_assoc_end_set = 0;
     cfg.dt         = 0.2;
+    cfg.advanced   = advanced_config_default();
     return cfg;
 }
 
@@ -106,6 +138,11 @@ typedef struct {
     double    Rmax;
     double    ka2, kd2, KD2_M, Rmax2;  /* For heterogeneous / two-state */
 
+    /* Per-cycle local parameters */
+    double    ri[MAX_CYCLES];          /* Bulk refractive index per cycle */
+    double    drift;                   /* Global linear drift rate (RU/s) */
+    double    tc;                      /* Mass transport coefficient (RU·M⁻¹·s⁻¹) */
+
     /* Fit quality */
     double    ssr, R2, chi2, rms;
     int       n_points;
@@ -113,6 +150,12 @@ typedef struct {
     /* Steady-state affinity */
     double    ss_KD_nM, ss_Rmax, ss_R2;
     double    ss_req[MAX_CYCLES];
+
+    /* U-value (parameter uniqueness): sqrt(λ_max/λ_min) of J^T·J */
+    double    u_value;                    /* <15 = good, >25 = correlated */
+
+    /* Parameter layout used for fitting */
+    ParamLayout layout;
 } FitResult;
 
 #endif /* SPR_TYPES_H */

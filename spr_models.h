@@ -16,13 +16,14 @@
  */
 void simulate_mck_cycle(ModelType model, const double *params,
                         const Cycle *cy, double *result,
-                        double t_assoc_end, double dt);
+                        double t_assoc_end, double dt, double tc);
 
 /*
  * Simulate an SCK trace (single continuous trace with staircase injections).
- * Same params layout as MCK.
+ * Same params layout as MCK. tc=0 disables mass transport.
  */
 void simulate_sck_trace(ModelType model, const double *params,
-                        const SPRData *data, double *result, double dt);
+                        const SPRData *data, double *result,
+                        double dt, double tc);
 
 #endif /* SPR_MODELS_H */

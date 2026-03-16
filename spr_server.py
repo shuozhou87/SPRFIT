@@ -56,7 +56,7 @@ def compile_fitter():
 
 
 def run_fitter(filepath, ref_path=None, model="langmuir", exclude=None,
-               assoc_end=None):
+               assoc_end=None, ri=False, drift=False, tc=False):
     """Run spr_fit on a data file and return parsed JSON result."""
     cmd = [C_BINARY, filepath]
     if ref_path and os.path.exists(ref_path):
@@ -67,6 +67,12 @@ def run_fitter(filepath, ref_path=None, model="langmuir", exclude=None,
         cmd += ["--exclude", ",".join(str(i) for i in exclude)]
     if assoc_end is not None:
         cmd += ["--assoc-end", str(assoc_end)]
+    if ri:
+        cmd.append("--ri")
+    if drift:
+        cmd.append("--drift")
+    if tc:
+        cmd.append("--tc")
 
     print(f"  Fitting {os.path.basename(filepath)} ...")
     ret = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -449,10 +455,10 @@ tr:hover td { background: #f0f3f6; }
 .toggle-btn { padding: 5px 14px; border-radius: 5px; border: 1px solid #bdc3c7;
                background: white; cursor: pointer; font-size: 0.85em; }
 .toggle-btn.active { background: #3498db; color: white; border-color: #3498db; }
-.refit-btn { padding: 6px 20px; border-radius: 6px; border: 2px solid #e67e22;
-             background: #f39c12; color: white; cursor: pointer; font-size: 0.9em;
+.refit-btn { padding: 6px 20px; border-radius: 6px; border: 2px solid #c0392b;
+             background: #e74c3c; color: white; cursor: pointer; font-size: 0.9em;
              font-weight: 600; transition: all 0.2s; }
-.refit-btn:hover { background: #e67e22; }
+.refit-btn:hover { background: #c0392b; }
 .refit-btn:disabled { background: #bdc3c7; border-color: #95a5a6; cursor: wait; }
 .export-btn { padding: 6px 20px; border-radius: 6px; border: 2px solid #27ae60;
               background: #2ecc71; color: white; cursor: pointer; font-size: 0.9em;
@@ -541,14 +547,22 @@ tr:hover td { background: #f0f3f6; }
     <option value="heterogeneous">Heterogeneous Ligand</option>
     <option value="twostate">Two-State (Conformational Change)</option>
   </select>
+  <details style="display:inline-block;margin-left:12px;vertical-align:middle;">
+    <summary style="cursor:pointer;font-size:13px;color:#2c3e50;">Advanced</summary>
+    <div style="margin-top:6px;font-size:13px;">
+      <label style="margin-right:10px;"><input type="checkbox" id="enableRI"> Bulk RI</label>
+      <label style="margin-right:10px;"><input type="checkbox" id="enableDrift"> Drift</label>
+      <label><input type="checkbox" id="enableTC"> Mass Transport</label>
+    </div>
+  </details>
 </div>
 
 <div class="controls">
   <div class="toggle-row">
-    <button class="toggle-btn active" id="btnData" onclick="toggleTrace('data')">Data</button>
-    <button class="toggle-btn active" id="btnFit" onclick="toggleTrace('fit')">Fit</button>
+    <button class="toggle-btn active" id="btnData" onclick="toggleTrace('data')">Show Data</button>
+    <button class="toggle-btn active" id="btnFit" onclick="toggleTrace('fit')">Show Fitted Curves</button>
   </div>
-  <button class="refit-btn" id="refitBtn" onclick="doRefit()">Re-fit with selected cycles</button>
+  <button class="refit-btn" id="refitBtn" onclick="doRefit()">Re-fit</button>
   <button class="export-btn" id="exportBtn" onclick="doExport()">Export PPTX</button>
   <button class="new-upload-btn" onclick="showUpload()">+ Add Data</button>
 </div>
@@ -866,6 +880,9 @@ async function doRefit() {
                 ref_file: d.ref_file_path || null,
                 model: model,
                 exclude: [...s.excluded],
+                ri: document.getElementById('enableRI').checked,
+                drift: document.getElementById('enableDrift').checked,
+                tc: document.getElementById('enableTC').checked,
             })
         });
         const result = await resp.json();
@@ -887,7 +904,9 @@ async function doRefit() {
                 logEl.textContent += 'kd2 = ' + result.kd2.toExponential(4) + '\n';
                 if (result.Rmax2) logEl.textContent += 'Rmax2 = ' + result.Rmax2.toFixed(3) + ' RU\n';
             }
-            logEl.textContent += 'R\u00b2 = ' + result.R2.toFixed(6) + '  RMS = ' + result.rms.toFixed(4) + '\n';
+            logEl.textContent += 'R\u00b2 = ' + result.R2.toFixed(6) + '  RMS = ' + result.rms.toFixed(4) + '  \u03c7\u00b2 = ' + (result.chi2||0).toExponential(3) + '\n';
+            if (result.advanced && (result.advanced.ri || result.advanced.drift || result.advanced.tc))
+                logEl.textContent += 'Advanced: ' + (result.advanced.ri ? 'RI ' : '') + (result.advanced.drift ? 'Drift ' : '') + (result.advanced.tc ? 'TC' : '') + ' enabled\n';
 
             updatePlots();
             buildSummary();
@@ -897,7 +916,7 @@ async function doRefit() {
     }
 
     btn.disabled = false;
-    btn.textContent = 'Re-fit with selected cycles';
+    btn.textContent = 'Re-fit';
 }
 
 // ── Export PPTX ──
@@ -1095,9 +1114,85 @@ function updatePlots() {
             '<tr><td>R<sub>max</sub></td><td class="metric">' + d.Rmax.toFixed(3) + '</td><td>RU</td></tr>';
     }
 
-    rows += '<tr><td>R\u00b2</td><td class="metric">' + d.R2.toFixed(6) + '</td><td></td></tr>' +
+    /* ── Quality Control Section ── */
+    rows += '<tr><td colspan="3" style="background:#2c3e50;color:#fff;font-weight:600;letter-spacing:0.5px;">Quality Control</td></tr>';
+
+    /* Helper for badge */
+    function qcBadge(label, color) {
+        return ' <span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;color:#fff;background:' + color + ';">' + label + '</span>';
+    }
+
+    /* Overall fit quality (R²) */
+    {
+        let fLabel, fColor;
+        if (d.R2 >= 0.99) { fLabel = 'Excellent'; fColor = '#27ae60'; }
+        else if (d.R2 >= 0.95) { fLabel = 'Good'; fColor = '#2980b9'; }
+        else if (d.R2 >= 0.90) { fLabel = 'Fair'; fColor = '#f39c12'; }
+        else { fLabel = 'Poor'; fColor = '#e74c3c'; }
+        rows += '<tr><td>R\u00b2</td><td class="metric">' + d.R2.toFixed(6) + qcBadge(fLabel, fColor) + '</td><td></td></tr>';
+    }
+    rows += '<tr><td>\u03c7\u00b2</td><td class="metric">' + (d.chi2||0).toExponential(4) + '</td><td>RU\u00b2</td></tr>' +
             '<tr><td>RMS</td><td class="metric">' + d.rms.toFixed(4) + '</td><td>RU</td></tr>' +
             '<tr><td>Data points</td><td class="metric">' + d.n_points + '</td><td></td></tr>';
+
+    /* U-value (parameter uniqueness) */
+    if (d.u_value !== undefined) {
+        const uv = d.u_value;
+        let uLabel, uColor;
+        if (uv < 15) { uLabel = 'Unique'; uColor = '#27ae60'; }
+        else if (uv < 25) { uLabel = 'Borderline'; uColor = '#f39c12'; }
+        else { uLabel = 'Correlated'; uColor = '#e74c3c'; }
+        rows += '<tr><td>U-value</td><td class="metric">' + uv.toFixed(1) + qcBadge(uLabel, uColor) + '</td><td></td></tr>';
+    }
+
+    /* Mass transport assessment */
+    if (d.advanced && d.advanced.tc && d.tc !== undefined && d.tc > 0) {
+        const ka_lin = d.ka;
+        const mtIndex = ka_lin * d.Rmax / d.tc;
+        let mtLabel, mtColor;
+        if (mtIndex < 0.2) { mtLabel = 'Negligible'; mtColor = '#27ae60'; }
+        else if (mtIndex < 1.0) { mtLabel = 'Moderate'; mtColor = '#f39c12'; }
+        else { mtLabel = 'Significant'; mtColor = '#e74c3c'; }
+        rows += '<tr><td>Mass Transport</td><td class="metric">k<sub>a</sub>\u00b7R<sub>max</sub>/t<sub>c</sub> = ' +
+                mtIndex.toFixed(2) + qcBadge(mtLabel, mtColor) + '</td><td></td></tr>' +
+                '<tr><td style="padding-left:16px;font-size:11px;color:#777;">t<sub>c</sub></td><td class="metric" style="font-size:11px;">' +
+                d.tc.toExponential(3) + '</td><td style="font-size:11px;">RU\u00b7M\u207b\u00b9\u00b7s\u207b\u00b9</td></tr>';
+    }
+
+    /* Drift assessment */
+    if (d.advanced && d.advanced.drift && d.drift !== undefined) {
+        const driftRate = Math.abs(d.drift);
+        /* Compare drift contribution over assoc time to Rmax */
+        const driftContrib = driftRate * (d.t_assoc_end || 60);
+        const driftPct = d.Rmax > 0 ? (driftContrib / d.Rmax * 100) : 0;
+        let drLabel, drColor;
+        if (driftPct < 2) { drLabel = 'Negligible'; drColor = '#27ae60'; }
+        else if (driftPct < 10) { drLabel = 'Moderate'; drColor = '#f39c12'; }
+        else { drLabel = 'Significant'; drColor = '#e74c3c'; }
+        rows += '<tr><td>Drift</td><td class="metric">' + d.drift.toExponential(3) +
+                ' RU/s (' + driftPct.toFixed(1) + '% of R<sub>max</sub>)' +
+                qcBadge(drLabel, drColor) + '</td><td></td></tr>';
+    }
+
+    /* Bulk RI assessment */
+    if (d.advanced && d.advanced.ri) {
+        let maxRI = 0;
+        d.cycles.forEach((cy) => { if (!cy.excluded && Math.abs(cy.ri) > maxRI) maxRI = Math.abs(cy.ri); });
+        const riPct = d.Rmax > 0 ? (maxRI / d.Rmax * 100) : 0;
+        let riLabel, riColor;
+        if (riPct < 5) { riLabel = 'Negligible'; riColor = '#27ae60'; }
+        else if (riPct < 20) { riLabel = 'Moderate'; riColor = '#f39c12'; }
+        else { riLabel = 'Significant'; riColor = '#e74c3c'; }
+        rows += '<tr><td>Bulk RI</td><td class="metric">max |RI| = ' + maxRI.toFixed(3) +
+                ' RU (' + riPct.toFixed(1) + '% of R<sub>max</sub>)' +
+                qcBadge(riLabel, riColor) + '</td><td></td></tr>';
+        /* Per-cycle RI detail (collapsible sub-rows) */
+        d.cycles.forEach((cy, i) => {
+            if (cy.excluded) return;
+            rows += '<tr><td style="padding-left:16px;font-size:11px;color:#777;">' + formatConc(cy.conc_nM) + '</td>' +
+                    '<td class="metric" style="font-size:11px;">RI = ' + cy.ri.toFixed(3) + '</td><td style="font-size:11px;">RU</td></tr>';
+        });
+    }
 
     if (d.ss_KD_nM > 0) {
         rows += '<tr><td colspan="3" style="background:#ecf0f1;font-weight:600;">Steady-State Affinity</td></tr>' +
@@ -1224,12 +1319,15 @@ class SPRHandler(BaseHTTPRequestHandler):
         ref_file = body.get("ref_file")
         model = body.get("model", "langmuir")
         exclude = body.get("exclude", [])
+        ri = body.get("ri", False)
+        drift = body.get("drift", False)
+        tc = body.get("tc", False)
 
         if not data_file or not os.path.exists(data_file):
             return {"error": f"Data file not found: {data_file}"}
 
-        print(f"  Re-fit: {os.path.basename(data_file)} model={model} exclude={exclude}")
-        result = run_fitter(data_file, ref_file, model, exclude)
+        print(f"  Re-fit: {os.path.basename(data_file)} model={model} exclude={exclude} ri={ri} drift={drift} tc={tc}")
+        result = run_fitter(data_file, ref_file, model, exclude, ri=ri, drift=drift, tc=tc)
         if result is None:
             return {"error": "Fitting failed"}
         return result

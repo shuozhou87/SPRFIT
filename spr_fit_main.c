@@ -11,6 +11,8 @@
  *   --mck                     Force MCK mode
  *   --restarts <N>            Number of random restarts (default 40)
  *   --assoc-end <T>           Association end time in seconds (default 60)
+ *   --ri                      Enable bulk RI fitting (per cycle)
+ *   --drift                   Enable linear drift fitting (per cycle)
  *
  * Output: JSON to stdout, log to stderr
  */
@@ -37,6 +39,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --sck / --mck       Force data format\n");
     fprintf(stderr, "  --restarts <N>      Random restarts (default 40)\n");
     fprintf(stderr, "  --assoc-end <T>     Association end time (default 60)\n");
+    fprintf(stderr, "  --ri                Enable bulk RI fitting (per cycle)\n");
+    fprintf(stderr, "  --drift             Enable linear drift fitting (per cycle)\n");
+    fprintf(stderr, "  --tc                Enable mass transport fitting\n");
 }
 
 static ModelType parse_model(const char *name) {
@@ -92,6 +97,12 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--assoc-end") == 0 && i+1 < argc) {
             cfg.t_assoc_end = atof(argv[++i]);
             cfg.t_assoc_end_set = 1;
+        } else if (strcmp(argv[i], "--ri") == 0) {
+            cfg.advanced.enable_ri = 1;
+        } else if (strcmp(argv[i], "--drift") == 0) {
+            cfg.advanced.enable_drift = 1;
+        } else if (strcmp(argv[i], "--tc") == 0) {
+            cfg.advanced.enable_tc = 1;
         } else {
             /* Legacy: second positional arg is reference file */
             if (!reffile) reffile = argv[i];
@@ -149,8 +160,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Output JSON (patch reference field) */
-    /* We output directly and replace reference flag */
+    /* Build param layout for output generation */
+    ParamLayout layout = result.layout;
+
+    /* Output JSON */
     double *buf = (double*)malloc(sizeof(double) * MAX_POINTS);
 
     printf("{\n");
@@ -161,6 +174,20 @@ int main(int argc, char *argv[]) {
     printf("  \"reference\": %s,\n", has_ref ? "true" : "false");
     if (has_ref) printf("  \"ref_file\": \"%s\",\n", reffile);
     printf("  \"t_assoc_end\": %.2f,\n", cfg.t_assoc_end);
+
+    /* Advanced config */
+    printf("  \"advanced\": {\"ri\": %s, \"drift\": %s, \"tc\": %s},\n",
+           cfg.advanced.enable_ri ? "true" : "false",
+           cfg.advanced.enable_drift ? "true" : "false",
+           cfg.advanced.enable_tc ? "true" : "false");
+
+    /* Global drift parameter */
+    if (cfg.advanced.enable_drift)
+        printf("  \"drift\": %.8e,\n", result.drift);
+
+    /* Global mass transport parameter */
+    if (cfg.advanced.enable_tc)
+        printf("  \"tc\": %.8e,\n", result.tc);
 
     printf("  \"ka\": %.8e,\n", result.ka);
     printf("  \"kd\": %.8e,\n", result.kd);
@@ -195,6 +222,9 @@ int main(int argc, char *argv[]) {
     }
     printf("],\n");
 
+    /* U-value */
+    printf("  \"u_value\": %.4f,\n", result.u_value);
+
     printf("  \"concentrations\": [");
     for (int i = 0; i < data.ncycles; i++) {
         if (i) printf(", ");
@@ -220,11 +250,14 @@ int main(int argc, char *argv[]) {
     for (int c = 0; c < data.ncycles; c++) {
         const Cycle *cy = &data.cycles[c];
 
-        if (data.mode == MODE_MCK)
+        if (data.mode == MODE_MCK) {
             simulate_mck_cycle(cfg.model, result.params, cy, buf,
-                              cfg.t_assoc_end, cfg.dt);
-        else
-            simulate_sck_trace(cfg.model, result.params, &data, buf, cfg.dt);
+                              cfg.t_assoc_end, cfg.dt, result.tc);
+            apply_local_corrections(result.params, &layout, c, cy, buf,
+                                   cfg.t_assoc_end);
+        } else {
+            simulate_sck_trace(cfg.model, result.params, &data, buf, cfg.dt, result.tc);
+        }
 
         double cy_ssr = 0;
         int cy_n = 0;
@@ -242,6 +275,9 @@ int main(int argc, char *argv[]) {
         printf("      \"excluded\": %s,\n", data.excluded[c] ? "true" : "false");
         printf("      \"cycle_ssr\": %.6f,\n", cy_ssr);
         printf("      \"cycle_rms\": %.6f,\n", sqrt(cy_ssr / (cy_n > 0 ? cy_n : 1)));
+
+        /* Per-cycle local params */
+        printf("      \"ri\": %.6f,\n", result.ri[c]);
 
         printf("      \"time\": ");
         json_print_double_array(cy->time, cy->npoints, DISPLAY_SKIP, "%.3f");
