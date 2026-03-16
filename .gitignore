@@ -1,0 +1,39 @@
+# Test/example data
+MCK data/
+SCK data/
+uploads/
+
+# Compiled binaries
+spr_fit
+mck_fit
+spr_fit_v2
+
+# Generated HTML reports
+*.html
+
+# Build artifacts
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# JSON results (generated)
+*.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Claude Code
+.claude/
+
+# Legacy scripts (superseded by spr_server.py)
+build_*.py
+fit_models.py
+mck_fit.c
+spr_fit.c
+spr_fit_v2.c
+
+# Development notes
+INSTRUCTIONS*.md
