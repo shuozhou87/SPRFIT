@@ -69,8 +69,8 @@ ParamLayout build_param_layout(ModelType model, const AdvancedConfig *adv,
 
     int idx = lay.n_global;
 
-    /* RI: one param per active cycle */
-    if (adv->enable_ri && data->mode == MODE_MCK) {
+    /* RI: one param per active cycle (MCK), or one param (SCK) */
+    if (adv->enable_ri) {
         lay.off_ri = idx;
         idx += lay.n_active;
     } else {
@@ -78,7 +78,7 @@ ParamLayout build_param_layout(ModelType model, const AdvancedConfig *adv,
     }
 
     /* Drift: single global param */
-    if (adv->enable_drift && data->mode == MODE_MCK) {
+    if (adv->enable_drift) {
         lay.off_drift = idx;
         idx += 1;
     } else {
@@ -139,12 +139,27 @@ static double cost(const double *params) {
             }
         }
     } else {
-        /* SCK: single trace, no local params */
+        /* SCK: single trace */
         simulate_sck_trace(model, params, g_data, tl_buf, g_cfg.dt, tc);
         const Cycle *cy = &g_data->cycles[0];
+
+        /* Get RI and drift corrections (cycle 0) */
+        double ri = 0.0, drift = 0.0;
+        if (g_layout.off_ri >= 0) {
+            int ai = g_layout.cycle_to_active[0];
+            if (ai >= 0) ri = params[g_layout.off_ri + ai];
+        }
+        if (g_layout.off_drift >= 0)
+            drift = params[g_layout.off_drift];
+
         for (int i = cy->fit_start; i < cy->npoints; i += skip) {
             if (cy->skip[i]) continue;
-            double r = cy->resp[i] - tl_buf[i];
+            double sim = tl_buf[i];
+            if (ri != 0.0 && cy->time[i] >= 0.0 && cy->time[i] < t_assoc)
+                sim += ri;
+            if (drift != 0.0 && cy->time[i] >= 0.0)
+                sim += drift * cy->time[i];
+            double r = cy->resp[i] - sim;
             ssr += r * r;
         }
     }
@@ -289,8 +304,10 @@ static void compute_req(const SPRData *data, double *req, double t_lo, double t_
     }
 }
 
-/* Simple 2-parameter Nelder-Mead for Req = Rmax * C / (KD + C) */
-static void ss_fit(const SPRData *data, const double *req, FitResult *result) {
+/* Simple 2-parameter Nelder-Mead for Req = Rmax * C / (KD + C)
+ * kinetic_KD_nM: hint from kinetic fit (kd/ka * 1e9), used to seed restart 0 */
+static void ss_fit(const SPRData *data, const double *req,
+                   double kinetic_KD_nM, FitResult *result) {
     double max_req = 0;
     int n_active = 0;
     for (int c = 0; c < data->ncycles; c++) {
@@ -309,10 +326,25 @@ static void ss_fit(const SPRData *data, const double *req, FitResult *result) {
     double best_ssr = 1e30;
     double best_KD = 1.0, best_Rmax = max_req;
 
-    for (int restart = 0; restart < 50; restart++) {
-        /* Random starting point */
-        double log_KD = -2.0 + 10.0 * ((double)rand() / RAND_MAX);
-        double Rm = max_req * (0.5 + 19.5 * ((double)rand() / RAND_MAX));
+    unsigned int ss_seed = (unsigned int)(time(NULL) ^ 0xA5A5A5A5u);
+    int n_restarts = 100;
+
+    for (int restart = 0; restart < n_restarts; restart++) {
+        double log_KD, Rm;
+
+        if (restart == 0 && kinetic_KD_nM > 0) {
+            /* Seed first restart at the kinetic KD */
+            log_KD = log10(kinetic_KD_nM);
+            Rm = max_req * 1.2;
+        } else if (restart == 1 && kinetic_KD_nM > 0) {
+            /* Second restart: offset from kinetic KD */
+            log_KD = log10(kinetic_KD_nM) + 0.5;
+            Rm = max_req * 2.0;
+        } else {
+            /* Random starting point */
+            log_KD = -2.0 + 10.0 * rand_r_double(&ss_seed);
+            Rm = max_req * (0.5 + 19.5 * rand_r_double(&ss_seed));
+        }
 
         /* Simplex vertices */
         double s[3][2] = {
@@ -856,6 +888,8 @@ int optim_fit(SPRData *data, const FitConfig *cfg, FitResult *result) {
                                    tl_buf, cfg->t_assoc_end);
         } else {
             simulate_sck_trace(cfg->model, global_best, data, tl_buf, cfg->dt, result->tc);
+            apply_local_corrections(global_best, &g_layout, c, &data->cycles[c],
+                                   tl_buf, cfg->t_assoc_end);
         }
 
         for (int i = data->cycles[c].fit_start; i < data->cycles[c].npoints; i++) {
@@ -905,7 +939,8 @@ int optim_fit(SPRData *data, const FitConfig *cfg, FitResult *result) {
         if (req_lo < 5.0) req_lo = 5.0;
         compute_req(data, req, req_lo, req_hi);
         memcpy(result->ss_req, req, sizeof(double) * data->ncycles);
-        ss_fit(data, req, result);
+        double kinetic_KD_nM = result->KD_M * 1e9;
+        ss_fit(data, req, kinetic_KD_nM, result);
         fprintf(stderr, "Steady-state: KD=%.2f nM  Rmax=%.3f RU  R2=%.5f\n",
                 result->ss_KD_nM, result->ss_Rmax, result->ss_R2);
     }

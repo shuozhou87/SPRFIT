@@ -354,60 +354,249 @@ int read_sck_data(const char *filename, SPRData *data, const FitConfig *cfg) {
     data->ncycles = 1;
     Cycle *cy = &data->cycles[0];
     cy->npoints = 0;
-    cy->conc_nM = 0;  /* Not meaningful for SCK */
+    cy->conc_nM = 0;  /* Not meaningful for SCK; injection concs in inj_conc_nM */
 
     while (fgets(line, sizeof(line), f)) {
         int len = (int)strlen(line);
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
         if (len == 0) continue;
+        if (cy->npoints >= MAX_POINTS) break;
 
-        if (cy->npoints >= MAX_POINTS * MAX_CYCLES) break;  /* Safety */
-
-        double t, r, ft, fr;
-        if (sscanf(line, "%lf %lf %lf %lf", &t, &r, &ft, &fr) >= 2) {
-            /* Store in cycle 0 (we'll use a larger buffer approach) */
-            if (cy->npoints < MAX_POINTS) {
-                cy->time[cy->npoints] = t;
-                cy->resp[cy->npoints] = r;
-                cy->inst_resp[cy->npoints] = fr;
-                cy->skip[cy->npoints] = 0;
-                cy->npoints++;
-            }
+        double t = 0, r = 0, ft = 0, fr = 0;
+        int nf = sscanf(line, "%lf %lf %lf %lf", &t, &r, &ft, &fr);
+        if (nf >= 2) {
+            cy->time[cy->npoints] = t;
+            cy->resp[cy->npoints] = r;
+            cy->inst_resp[cy->npoints] = (nf >= 4) ? fr : 0.0;
+            cy->skip[cy->npoints] = 0;
+            cy->npoints++;
         }
     }
     fclose(f);
 
-    /* Compute baseline from t < 0 */
+    /* ── Auto-detect injection boundaries ──
+     *
+     * Biacore SCK exports have two artifact patterns at injection transitions:
+     *
+     * Pattern A (time gaps): Missing data points create time gaps > 1s.
+     *   Each injection transition has one gap at start and one at end.
+     *
+     * Pattern B (response artifacts): No time gaps, but response values
+     *   are replaced with the time value at boundaries (resp ≈ time).
+     *   These show as huge response jumps (dr > 50 RU in one step).
+     *
+     * In both cases, boundaries come in pairs for each injection:
+     *   boundary[2k]   = start of injection k
+     *   boundary[2k+1] = end of injection k
+     */
+
+    /* Compute median dt */
+    double median_dt = 0.1;
+    if (cy->npoints > 10) {
+        double *dts = (double*)malloc(sizeof(double) * (cy->npoints - 1));
+        for (int j = 0; j < cy->npoints - 1; j++)
+            dts[j] = cy->time[j+1] - cy->time[j];
+        /* Simple selection sort for median (small array in practice) */
+        int ndt = cy->npoints - 1;
+        for (int i = 0; i < ndt/2 + 1; i++) {
+            int mi = i;
+            for (int j = i+1; j < ndt; j++)
+                if (dts[j] < dts[mi]) mi = j;
+            double tmp = dts[i]; dts[i] = dts[mi]; dts[mi] = tmp;
+        }
+        median_dt = dts[ndt/2];
+        free(dts);
+    }
+
+    /* Detect boundaries — try time gaps first, then response artifacts */
+    double gap_before[64], gap_after[64]; /* boundary pairs */
+    int n_boundaries = 0;
+
+    /* Method A: Time gap detection (dt > 4 * median_dt) */
+    for (int j = 0; j < cy->npoints - 1 && n_boundaries < 64; j++) {
+        double dt = cy->time[j+1] - cy->time[j];
+        if (dt > median_dt * 4.0 && dt > 0.5) {
+            gap_before[n_boundaries] = cy->time[j];
+            gap_after[n_boundaries] = cy->time[j+1];
+            n_boundaries++;
+        }
+    }
+
+    /* Method B: Response artifact detection (if no time gaps found)
+     * Biacore artifacts: resp ≈ time at boundaries, causing huge jumps */
+    if (n_boundaries == 0) {
+        /* First pass: mark artifact points (resp ≈ time for t > 5) */
+        int *is_artifact = (int*)calloc(cy->npoints, sizeof(int));
+
+        /* Mark candidate artifact points: resp ≈ time (Biacore-specific) */
+        for (int j = 0; j < cy->npoints; j++) {
+            if (cy->time[j] > 5.0 &&
+                fabs(cy->resp[j] - cy->time[j]) < 1.0) {
+                is_artifact[j] = 1;
+            }
+        }
+        /* Also mark t=0 exact zeros */
+        for (int j = 0; j < cy->npoints; j++) {
+            if (fabs(cy->time[j]) < 0.01 && cy->resp[j] == 0.0)
+                is_artifact[j] = 1;
+        }
+
+        /* Filter: only keep runs of >= 8 consecutive candidates.
+         * This rejects false positives where response coincidentally
+         * equals time (e.g., 750 RU response at t=750s). Real Biacore
+         * artifacts always produce long runs (15-25 points). */
+        {
+            int run_start = -1;
+            for (int j = 0; j <= cy->npoints; j++) {
+                int art = (j < cy->npoints) ? is_artifact[j] : 0;
+                if (art && run_start < 0) {
+                    run_start = j;
+                } else if (!art && run_start >= 0) {
+                    int run_len = j - run_start;
+                    if (run_len < 8) {
+                        /* Too short — clear these candidates */
+                        for (int k = run_start; k < j; k++)
+                            is_artifact[k] = 0;
+                    }
+                    run_start = -1;
+                }
+            }
+        }
+
+        /* Group consecutive artifact points into boundary regions */
+        int in_region = 0;
+        double region_start = 0;
+        for (int j = 0; j < cy->npoints; j++) {
+            if (is_artifact[j] && !in_region) {
+                in_region = 1;
+                region_start = (j > 0) ? cy->time[j-1] : cy->time[j];
+            } else if (!is_artifact[j] && in_region) {
+                if (n_boundaries < 64) {
+                    gap_before[n_boundaries] = region_start;
+                    gap_after[n_boundaries] = cy->time[j];
+                    n_boundaries++;
+                }
+                in_region = 0;
+            }
+        }
+
+        /* Mark artifact points as skip */
+        for (int j = 0; j < cy->npoints; j++)
+            if (is_artifact[j]) cy->skip[j] = 1;
+
+        /* If the first boundary is well after t=0, the t=0 single-zero
+         * marker was filtered out. Prepend a synthetic boundary so that
+         * the first injection starts at t≈0. */
+        if (n_boundaries > 0 && gap_after[0] > 10.0) {
+            /* Find first point at or after t=0 */
+            double t0_after = 0.1;
+            for (int j = 0; j < cy->npoints; j++) {
+                if (cy->time[j] >= 0.0 && !is_artifact[j]) {
+                    t0_after = cy->time[j];
+                    break;
+                }
+            }
+            /* Shift all boundaries right by 1 */
+            for (int b = n_boundaries; b > 0; b--) {
+                gap_before[b] = gap_before[b-1];
+                gap_after[b] = gap_after[b-1];
+            }
+            /* Insert synthetic boundary at t=0 */
+            gap_before[0] = -0.5;
+            gap_after[0] = t0_after;
+            n_boundaries++;
+        }
+
+        free(is_artifact);
+    } else {
+        /* For time-gap data, mark points in gap regions as skip
+         * (there are no actual data points in the gaps, but mark the
+         *  guard band around gap edges) */
+    }
+
+    /* Guard band: skip points within 2s of any boundary edge */
+    for (int b = 0; b < n_boundaries; b++) {
+        for (int j = 0; j < cy->npoints; j++) {
+            if (cy->time[j] >= gap_before[b] - 0.5 &&
+                cy->time[j] <= gap_after[b] + 0.5)
+                cy->skip[j] = 1;
+        }
+    }
+
+    /* ── Derive injection schedule from boundaries ──
+     * Boundaries come in pairs: even = injection start, odd = injection end.
+     * If first boundary is very close to t=0, it's the pre-injection marker.
+     */
+    int n_inj_detected = n_boundaries / 2;
+
+    if (n_inj_detected == data->n_injections) {
+        /* Perfect match: boundary[2k] and boundary[2k+1] bracket injection k */
+        for (int i = 0; i < data->n_injections; i++) {
+            data->inj_start[i] = gap_after[2*i];      /* after the start gap */
+            data->inj_end[i]   = gap_before[2*i + 1];  /* before the end gap */
+        }
+    } else if (n_boundaries > 0) {
+        /* Heuristic: try to match boundaries to injections */
+        /* If we have 2*N boundaries but N != n_injections, log a warning
+         * and use the boundaries we found */
+        fprintf(stderr, "  Warning: detected %d boundaries for %d injections\n",
+                n_boundaries, data->n_injections);
+        int n_use = (n_boundaries / 2 < data->n_injections) ?
+                    n_boundaries / 2 : data->n_injections;
+        for (int i = 0; i < n_use; i++) {
+            data->inj_start[i] = gap_after[2*i];
+            data->inj_end[i]   = gap_before[2*i + 1];
+        }
+        /* If we detected more injections than header says, trim */
+        if (n_inj_detected < data->n_injections)
+            data->n_injections = n_inj_detected;
+    } else {
+        /* Fallback: no boundaries detected, use equal-duration schedule */
+        fprintf(stderr, "  Warning: no injection boundaries detected, using default schedule\n");
+        double total_time = cy->time[cy->npoints-1];
+        double cycle_dur = total_time / data->n_injections;
+        double assoc_dur = cycle_dur * 0.67;
+        for (int i = 0; i < data->n_injections; i++) {
+            data->inj_start[i] = i * cycle_dur;
+            data->inj_end[i] = i * cycle_dur + assoc_dur;
+        }
+    }
+
+    /* Log detected injection schedule */
+    for (int i = 0; i < data->n_injections; i++) {
+        fprintf(stderr, "  Injection %d: %.1f nM, t=[%.1f, %.1f] (%.1fs)\n",
+                i+1, data->inj_conc_nM[i],
+                data->inj_start[i], data->inj_end[i],
+                data->inj_end[i] - data->inj_start[i]);
+    }
+
+    /* ── Baseline subtraction ── */
     double sum = 0.0;
     int count = 0;
     for (int j = 0; j < cy->npoints; j++) {
-        if (cy->time[j] < 0.0) { sum += cy->resp[j]; count++; }
+        if (cy->time[j] < 0.0 && !cy->skip[j]) {
+            sum += cy->resp[j];
+            count++;
+        }
     }
     cy->baseline = (count > 0) ? sum / count : 0.0;
     for (int j = 0; j < cy->npoints; j++)
         cy->resp[j] -= cy->baseline;
 
+    /* Find fit_start */
     cy->fit_start = cy->npoints;
     for (int j = 0; j < cy->npoints; j++) {
         if (cy->time[j] >= 0.0) { cy->fit_start = j; break; }
     }
 
-    /* Auto-detect injection boundaries from data:
-     * SCK injections are typically equal-duration association phases
-     * followed by a final long dissociation. We use the default schedule
-     * of 120s association + 60s dissociation per injection, with the last
-     * injection having a long dissociation. */
-    double assoc_dur = 120.0;   /* Default association duration */
-    double short_dissoc = 60.0; /* Short dissociation between injections */
+    /* Count skipped points */
+    int n_skip = 0;
+    for (int j = cy->fit_start; j < cy->npoints; j++)
+        if (cy->skip[j]) n_skip++;
 
-    for (int i = 0; i < data->n_injections; i++) {
-        double t_start = i * (assoc_dur + short_dissoc);
-        data->inj_start[i] = t_start;
-        data->inj_end[i] = t_start + assoc_dur;
-    }
-
-    fprintf(stderr, "  SCK trace: %d points, t=[%.1f, %.1f], %d injections\n",
-            cy->npoints, cy->time[0], cy->time[cy->npoints-1], data->n_injections);
+    fprintf(stderr, "  SCK trace: %d points, t=[%.1f, %.1f], %d injections, %d artifacts skipped\n",
+            cy->npoints, cy->time[0], cy->time[cy->npoints-1],
+            data->n_injections, n_skip);
 
     return 0;
 }
@@ -425,7 +614,20 @@ int read_spr_data(const char *filename, SPRData *data, const FitConfig *cfg) {
     if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
     fclose(f);
 
-    /* Count tabs to distinguish formats:
+    /* SCK headers list multiple concentrations: "Conc 8 40 200 1000 5000 nM".
+     * MCK headers have one concentration per column: "Conc 100 nM".
+     * Check for multi-concentration header first — this is the definitive
+     * SCK indicator, even if the file has many tab-columns (e.g., SCK
+     * with replicates exported as separate column groups). */
+    double test_concs[MAX_INJECTIONS];
+    int n_concs = parse_sck_concs(line, test_concs, MAX_INJECTIONS);
+
+    if (n_concs > 1) {
+        fprintf(stderr, "Auto-detected SCK format (multi-concentration header)\n");
+        return read_sck_data(filename, data, cfg);
+    }
+
+    /* Count tabs to distinguish single-conc formats:
      * MCK: many columns (4 per cycle, so >= 8 tabs for 2+ cycles)
      * SCK: 4 columns (3 tabs) */
     int ntabs = 0;
@@ -446,7 +648,7 @@ int read_spr_data(const char *filename, SPRData *data, const FitConfig *cfg) {
 /* ================================================================ */
 
 int subtract_reference(SPRData *data, const char *ref_filename, const FitConfig *cfg) {
-    SPRData ref;
+    static SPRData ref;
     memset(&ref, 0, sizeof(ref));
 
     if (read_mck_data(ref_filename, &ref, cfg) != 0) return -1;

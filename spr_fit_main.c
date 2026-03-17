@@ -77,7 +77,7 @@ int main(int argc, char *argv[]) {
     int force_mode = -1;  /* -1=auto, 0=MCK, 1=SCK */
 
     FitConfig cfg = fit_config_default();
-    SPRData data;
+    static SPRData data;
     memset(&data, 0, sizeof(data));
 
     /* Parse options */
@@ -126,8 +126,10 @@ int main(int argc, char *argv[]) {
         cfg.t_assoc_end = detect_mck_assoc_end(&data);
     }
 
-    /* Preprocess (baseline subtraction, artifact marking) */
-    preprocess_data(&data, cfg.guard_time);
+    /* Preprocess (baseline subtraction, artifact marking) — MCK only.
+     * SCK preprocessing is done inside read_sck_data(). */
+    if (data.mode == MODE_MCK)
+        preprocess_data(&data, cfg.guard_time);
 
     /* Reference subtraction */
     int has_ref = 0;
@@ -257,6 +259,8 @@ int main(int argc, char *argv[]) {
                                    cfg.t_assoc_end);
         } else {
             simulate_sck_trace(cfg.model, result.params, &data, buf, cfg.dt, result.tc);
+            apply_local_corrections(result.params, &layout, c, &data.cycles[c], buf,
+                                   cfg.t_assoc_end);
         }
 
         double cy_ssr = 0;

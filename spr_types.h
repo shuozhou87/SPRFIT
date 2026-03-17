@@ -8,7 +8,7 @@
 #define SPR_TYPES_H
 
 #define MAX_CYCLES      30
-#define MAX_POINTS      2500
+#define MAX_POINTS      25000
 #define MAX_PARAMS      128     /* Enough for global + local (RI, drift per cycle) */
 #define MAX_INJECTIONS  10
 #define DISPLAY_SKIP    5       /* Output every Nth point for display */
